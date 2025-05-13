@@ -14,7 +14,7 @@ spec:
         - name: TRANSFORMERS_CACHE
           value: "/tmp/huggingface"
         - name: NEO4J_URI
-          value: "bolt://10.0.53.22:30687"
+          value: "bolt://"
         - name: NEO4J_USERNAME
           value: "neo4j"
         - name: NEO4J_PASSWORD
