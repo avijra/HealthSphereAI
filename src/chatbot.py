@@ -7,16 +7,19 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 import httpx
 
+# Set up logging first
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 import httpx
-from langchain.graphs import Neo4jGraph
-from langchain.vectorstores.neo4j_vector import Neo4jVector
-from langchain.embeddings.huggingface import HuggingFaceBgeEmbeddings
+from langchain_community.graphs import Neo4jGraph
+from langchain_community.vectorstores import Neo4jVector
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain.chat_models import ChatOllama
-from langchain import PromptTemplate
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain.prompts import PromptTemplate
@@ -32,16 +35,124 @@ DATABASE = os.getenv('NEO4J_DATABASE')
 VLLM_URL = os.getenv('VLLM_URL')
 VLLM_MODEL = os.getenv('VLLM_MODEL', 'mistral')
 
+from langchain.schema import BaseMessage, ChatResult, ChatGeneration, AIMessage
+from langchain.chat_models.base import BaseChatModel
+from pydantic import Field, BaseModel
+from typing import List, Optional, Dict, Any
+
+class MistralChatModel(BaseChatModel):
+    """Custom Mistral chat model to handle parameter conversion and API calls."""
+    
+    base_url: str = Field(..., description="Base URL for the Mistral API")
+    model: str = Field(default="mistral", description="Model name")
+    max_tokens: int = Field(default=1024, description="Maximum number of tokens to generate")
+    temperature: float = Field(default=0.7, description="Temperature for sampling")
+    request_timeout: int = Field(default=300, description="Request timeout in seconds")
+    
+    _http_client: Optional[httpx.Client] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def __init__(self, **kwargs):
+        if 'max_completion_tokens' in kwargs:
+            kwargs['max_tokens'] = kwargs.pop('max_completion_tokens')
+        if 'openai_api_base' in kwargs:
+            kwargs['base_url'] = kwargs.pop('openai_api_base')
+            
+        super().__init__(**kwargs)
+        self._http_client = httpx.Client(verify=False)
+        logger.info(f"Initialized MistralChatModel with base_url: {self.base_url}, model: {self.model}")
+
+    def _generate(self, messages: List[BaseMessage], stop: Optional[List[str]] = None) -> ChatResult:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        # Convert messages to the format expected by Mistral API
+        formatted_messages = []
+        for msg in messages:
+            if msg.type == "system":
+                formatted_messages.append({"role": "system", "content": msg.content})
+            elif msg.type == "human":
+                formatted_messages.append({"role": "user", "content": msg.content})
+            elif msg.type == "ai":
+                formatted_messages.append({"role": "assistant", "content": msg.content})
+        
+        payload = {
+            "model": self.model,
+            "messages": formatted_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": False
+        }
+        
+        if stop:
+            payload["stop"] = stop
+            
+        try:
+            logger.info(f"Making request to Mistral API at: {self.base_url}/chat/completions")
+            logger.info(f"Request headers: {headers}")
+            logger.info(f"Request payload: {json.dumps(payload, indent=2)}")
+            
+            response = self._http_client.post(
+                f"{self.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=self.request_timeout
+            )
+            
+            logger.info(f"Response status code: {response.status_code}")
+            logger.info(f"Response headers: {dict(response.headers)}")
+            logger.info(f"Response body: {response.text}")
+            
+            if response.status_code != 200:
+                logger.error(f"API Error: {response.status_code} - {response.text}")
+                raise Exception(f"API Error: {response.status_code} - {response.text}")
+                
+            response_data = response.json()
+            
+            if "choices" not in response_data or len(response_data["choices"]) == 0:
+                raise Exception("No choices in response")
+            
+            # Extract the message content from the response
+            message_content = response_data["choices"][0]["message"]["content"]
+            
+            # Create the ChatGeneration with proper structure
+            generation = ChatGeneration(
+                message=AIMessage(content=message_content),
+                generation_info=response_data["choices"][0]
+            )
+            
+            # Create the ChatResult with proper structure
+            return ChatResult(
+                generations=[generation],
+                llm_output={
+                    "token_usage": response_data.get("usage", {}),
+                    "model_name": self.model
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in Mistral API call: {str(e)}")
+            raise
+
+    @property
+    def _llm_type(self) -> str:
+        return "mistral"
+
+    def __del__(self):
+        if self._http_client:
+            self._http_client.close()
+
 def get_vllm_instance():
-    client = httpx.Client(verify=False)
-    return ChatOpenAI(
+    """Create and return a configured Mistral chat model instance."""
+    return MistralChatModel(
+        base_url=VLLM_URL,
         model=VLLM_MODEL,
-        openai_api_key="NOT_NEEDED",
-        openai_api_base=VLLM_URL,
         max_tokens=1024,
         temperature=1,
-        http_client=client,
-        max_retries=3,
         request_timeout=300,
     )
 
@@ -175,10 +286,6 @@ CUSTOM_DOCUMENT_PROMPT = PromptTemplate(
     template="{page_content}"
 )
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 def ask_date_question(question_to_ask, model=vllm_model, prompt_to_use=prompt):
     logger.info(f"Received question: {question_to_ask}")
     _date_str = date_for_question(question_to_ask, model)
@@ -308,4 +415,3 @@ def get_all_hospital_names():
 
 # Make sure this line is at the end of your chatbot.py file
 __all__ = ['ask_date_question', 'get_all_patient_names', 'get_all_hospital_names', 'refresh_vector_index']
-
